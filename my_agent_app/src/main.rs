@@ -133,6 +133,10 @@ struct SandboxApp {
     chat_input: String,
     chat_history: Vec<ChatMessage>,
     
+    // Cached workspace items
+    cached_items: Vec<PathBuf>,
+    selected_suggestion_index: Option<usize>,
+    
     // Async communications
     logs: Vec<LogEntry>,
     tx: Sender<LogEntry>,
@@ -167,14 +171,46 @@ impl SandboxApp {
             list_path: "".to_string(),
             chat_input: "".to_string(),
             chat_history: Vec::new(),
+            cached_items: Vec::new(),
+            selected_suggestion_index: None,
             logs: Vec::new(),
             tx,
             rx,
         };
         
+        app.scan_workspace_files();
         app.logs.push(LogEntry::info("Sandbox UI initialized successfully."));
         app.logs.push(LogEntry::info(format!("Loaded project '{}' with {} folders.", app.project_name, app.workspace.folders.len())));
         app
+    }
+
+    fn scan_workspace_files(&mut self) {
+        let mut items = Vec::new();
+        for folder in &self.workspace.folders {
+            if folder.exists() && folder.is_dir() {
+                let mut stack = vec![folder.clone()];
+                while let Some(current_dir) = stack.pop() {
+                    // Include the directory itself in the suggestion list
+                    items.push(current_dir.clone());
+                    
+                    if let Ok(entries) = std::fs::read_dir(&current_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if let Ok(metadata) = entry.metadata() {
+                                if metadata.is_dir() {
+                                    stack.push(path.clone());
+                                } else {
+                                    items.push(path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        items.sort();
+        items.dedup();
+        self.cached_items = items;
     }
 
     fn save_current_project_state(&mut self) {
@@ -259,6 +295,7 @@ impl eframe::App for SandboxApp {
                     for folder in &selected_project.folders {
                         let _ = self.workspace.add_folder(folder);
                     }
+                    self.scan_workspace_files();
                     self.logs.push(LogEntry::info(format!("Switched to project: {}", self.project_name)));
                 }
 
@@ -279,6 +316,7 @@ impl eframe::App for SandboxApp {
                             self.project_name = trimmed.clone();
                             self.workspace = Workspace::new(&trimmed);
                             self.new_project_name_input.clear();
+                            self.scan_workspace_files();
                             self.logs.push(LogEntry::success(format!("Created new project: {}", trimmed)));
                         }
                     }
@@ -318,6 +356,7 @@ impl eframe::App for SandboxApp {
                                     if ui.button("❌").clicked() {
                                         self.workspace.remove_folder(folder);
                                         self.save_current_project_state();
+                                        self.scan_workspace_files();
                                         self.logs.push(LogEntry::info(format!("Removed folder: {:?}", folder)));
                                     }
                                 });
@@ -332,6 +371,7 @@ impl eframe::App for SandboxApp {
                         match self.workspace.add_folder(&path) {
                             Ok(_) => {
                                 self.save_current_project_state();
+                                self.scan_workspace_files();
                                 self.logs.push(LogEntry::success(format!("Successfully added workspace folder: {:?}", path)));
                             }
                             Err(e) => {
@@ -489,7 +529,64 @@ impl eframe::App for SandboxApp {
                 }
             } else {
                 // INTERACTIVE CHAT CLI TAB
-                let chat_scroll_height = ui.available_height() - 120.0;
+                // Calculate size based on dropdown state
+                let has_at = self.chat_input.contains('@');
+                let last_at_idx = self.chat_input.rfind('@');
+                
+                let mut suggestions = Vec::new();
+                if has_at && last_at_idx.is_some() {
+                    let query = self.chat_input[last_at_idx.unwrap() + 1..].to_lowercase();
+                    for item in &self.cached_items {
+                        let path_str = item.to_string_lossy().to_lowercase();
+                        let file_name = item.file_name()
+                            .map(|n| n.to_string_lossy().to_lowercase())
+                            .unwrap_or_default();
+                        if file_name.contains(&query) || path_str.contains(&query) {
+                            suggestions.push(item.clone());
+                        }
+                    }
+                }
+                
+                let show_suggestions = !suggestions.is_empty();
+                if show_suggestions {
+                    if let Some(idx) = self.selected_suggestion_index {
+                        if idx >= suggestions.len() {
+                            self.selected_suggestion_index = Some(suggestions.len() - 1);
+                        }
+                    } else {
+                        self.selected_suggestion_index = Some(0);
+                    }
+                } else {
+                    self.selected_suggestion_index = None;
+                }
+
+                // Keyboard navigation inside suggestions list
+                let mut arrow_up_pressed = false;
+                let mut arrow_down_pressed = false;
+                if show_suggestions {
+                    ui.input(|i| {
+                        if i.key_pressed(egui::Key::ArrowDown) {
+                            arrow_down_pressed = true;
+                        }
+                        if i.key_pressed(egui::Key::ArrowUp) {
+                            arrow_up_pressed = true;
+                        }
+                    });
+                }
+
+                if arrow_down_pressed {
+                    if let Some(idx) = self.selected_suggestion_index {
+                        self.selected_suggestion_index = Some((idx + 1) % suggestions.len());
+                    }
+                }
+                if arrow_up_pressed {
+                    if let Some(idx) = self.selected_suggestion_index {
+                        self.selected_suggestion_index = Some((idx + suggestions.len() - 1) % suggestions.len());
+                    }
+                }
+
+                let dropdown_height = if show_suggestions { 130.0 } else { 0.0 };
+                let chat_scroll_height = ui.available_height() - 120.0 - dropdown_height;
                 
                 egui::ScrollArea::vertical()
                     .id_salt("chat_scroll")
@@ -501,7 +598,7 @@ impl eframe::App for SandboxApp {
                                 ui.add_space(40.0);
                                 ui.weak("Interactive Chat CLI is ready.");
                                 ui.weak("Type /help to see available commands.");
-                                ui.weak("Example: `/readfile a.txt @x` to read file specifically from folder tagged @x.");
+                                ui.weak("Autocomplete is active. Type @ followed by letters to search workspace files/folders.");
                             });
                         } else {
                             for msg in &self.chat_history {
@@ -526,29 +623,82 @@ impl eframe::App for SandboxApp {
 
                 ui.separator();
 
-                // Suggestion helper buttons for tags
-                let folders_list = self.workspace.folders.clone();
-                if !folders_list.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.weak("Tag suggestions (click to insert):");
-                        for folder in &folders_list {
-                            if let Some(name) = folder.file_name() {
-                                let tag_name = name.to_string_lossy();
-                                let tag_btn_text = format!("@{}", tag_name);
-                                if ui.button(&tag_btn_text).clicked() {
-                                    self.chat_input.push_str(&format!(" @{}", tag_name));
+                let mut apply_suggestion = false;
+
+                // Autocomplete dropdown UI
+                if show_suggestions {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("🔍 Workspace Autocomplete Suggestions:").strong());
+                            ui.weak("(Arrow Up/Down to navigate, Enter or Click to select)");
+                        });
+                        egui::ScrollArea::vertical().id_salt("suggest_scroll").max_height(100.0).show(ui, |ui| {
+                            for (i, item) in suggestions.iter().enumerate().take(20) {
+                                let name = item.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| item.to_string_lossy().into_owned());
+                                let path_str = item.to_string_lossy().into_owned();
+                                let is_dir = item.is_dir();
+                                
+                                let display_btn = if is_dir {
+                                    format!("📁 {} ({})", name, path_str)
+                                } else {
+                                    format!("📄 {} ({})", name, path_str)
+                                };
+                                
+                                let is_selected = Some(i) == self.selected_suggestion_index;
+                                if ui.selectable_label(is_selected, egui::RichText::new(display_btn).monospace()).clicked() {
+                                    self.selected_suggestion_index = Some(i);
+                                    apply_suggestion = true;
                                 }
                             }
-                        }
+                        });
                     });
                 }
 
                 // Chat Input bar
                 ui.horizontal(|ui| {
-                    let text_edit = ui.text_edit_singleline(&mut self.chat_input);
+                    let text_edit = ui.add(egui::TextEdit::singleline(&mut self.chat_input).id_source("chat_input_text_edit"));
                     let enter_pressed = text_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     
-                    if (ui.button("Send").clicked() || enter_pressed) && !self.chat_input.trim().is_empty() {
+                    let mut send_triggered = false;
+                    
+                    if enter_pressed || ui.button("Send").clicked() {
+                        if show_suggestions && self.selected_suggestion_index.is_some() {
+                            apply_suggestion = true;
+                        } else if !self.chat_input.trim().is_empty() {
+                            send_triggered = true;
+                        }
+                    }
+
+                    if apply_suggestion {
+                        if let Some(idx) = self.selected_suggestion_index {
+                            if idx < suggestions.len() {
+                                let item = &suggestions[idx];
+                                let path_str = item.to_string_lossy();
+                                
+                                if let Some(last_at) = last_at_idx {
+                                    let before_at = &self.chat_input[..last_at];
+                                    self.chat_input = format!("{}\"{}\"", before_at, path_str);
+                                }
+                            }
+                        }
+                        self.selected_suggestion_index = None;
+                    }
+
+                    let mut request_refocus = false;
+                    if apply_suggestion {
+                        request_refocus = true;
+                    }
+                    if show_suggestions && (text_edit.changed() || arrow_up_pressed || arrow_down_pressed) {
+                        request_refocus = true;
+                    }
+
+                    if request_refocus {
+                        text_edit.request_focus();
+                    }
+
+                    if send_triggered {
                         let input = self.chat_input.trim().to_string();
                         self.chat_input.clear();
 
@@ -565,11 +715,74 @@ impl eframe::App for SandboxApp {
                             if input.starts_with("/readfile") {
                                 let rest = input.trim_start_matches("/readfile").trim();
                                 if rest.is_empty() {
-                                    tx.send(LogEntry::chat_error("Usage: /readfile <filename> [@folder]")).unwrap();
+                                    tx.send(LogEntry::chat_error("Usage: /readfile <filename> [@folder], /readfile @<folder>/<filename>, or click autocomplete suggestions")).unwrap();
                                     return;
                                 }
                                 
-                                // Parse tag if present
+                                // Strip quotes if present
+                                let rest = if rest.starts_with('"') && rest.ends_with('"') && rest.len() > 1 {
+                                    &rest[1..rest.len()-1]
+                                } else {
+                                    rest
+                                };
+                                
+                                // Parse absolute path directly
+                                let path_buf = PathBuf::from(rest);
+                                if path_buf.is_absolute() {
+                                    let tool = ReadFileTool::new();
+                                    tx.send(LogEntry::chat_info(format!("Reading absolute path: {:?}", path_buf))).unwrap();
+                                    match tool.run(&ws, &path_buf).await {
+                                        Ok(content) => {
+                                            tx.send(LogEntry::chat_success(format!("--- CONTENT OF {:?} ---\n{}\n------------------", path_buf, content))).unwrap();
+                                        }
+                                        Err(e) => {
+                                            tx.send(LogEntry::chat_error(format!("Failed to read file: {}", e))).unwrap();
+                                        }
+                                    }
+                                    return;
+                                }
+
+                                // Parse @folder/file format
+                                if rest.starts_with('@') {
+                                    let rest_clean = rest.trim_start_matches('@');
+                                    let parts: Vec<&str> = rest_clean.splitn(2, '/').collect();
+                                    if parts.len() == 2 {
+                                        let folder_tag = parts[0].trim();
+                                        let filename = parts[1].trim();
+                                        
+                                        let mut matched_folder = None;
+                                        for folder in &ws.folders {
+                                            if let Some(name) = folder.file_name() {
+                                                if name.to_string_lossy() == folder_tag {
+                                                    matched_folder = Some(folder.clone());
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        
+                                        match matched_folder {
+                                            Some(folder_path) => {
+                                                let tool = ReadFileTool::new();
+                                                let full_path = folder_path.join(filename);
+                                                tx.send(LogEntry::chat_info(format!("Reading {:?} from @{}", filename, folder_tag))).unwrap();
+                                                match tool.run(&ws, &full_path).await {
+                                                    Ok(content) => {
+                                                        tx.send(LogEntry::chat_success(format!("--- CONTENT OF @{}/{} ---\n{}\n------------------", folder_tag, filename, content))).unwrap();
+                                                    }
+                                                    Err(e) => {
+                                                        tx.send(LogEntry::chat_error(format!("Failed to read file: {}", e))).unwrap();
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                tx.send(LogEntry::chat_error(format!("Folder tag '@{}' not found in workspace.", folder_tag))).unwrap();
+                                            }
+                                        }
+                                        return;
+                                    }
+                                }
+
+                                // Parse old format: "filename @folder" or "filename"
                                 let (filename, tag) = if let Some(pos) = rest.find('@') {
                                     (rest[..pos].trim(), Some(rest[pos+1..].trim()))
                                 } else {
@@ -602,7 +815,7 @@ impl eframe::App for SandboxApp {
                                             }
                                         }
                                         None => {
-                                            tx.send(LogEntry::chat_error(format!("Folder tag '@{}' not found in workspace. Register folder first.", folder_tag))).unwrap();
+                                            tx.send(LogEntry::chat_error(format!("Folder tag '@{}' not found in workspace.", folder_tag))).unwrap();
                                         }
                                     }
                                 } else {
@@ -648,12 +861,43 @@ impl eframe::App for SandboxApp {
                                         for (tag, _) in &matching_folders {
                                             msg.push_str(&format!("  - @{}\n", tag));
                                         }
-                                        msg.push_str(&format!("\nPlease specify which one you want to read, e.g.:\n  `/readfile {} @{}`", filename, matching_folders[0].0));
+                                        msg.push_str(&format!("\nPlease specify which one you want to read, e.g.:\n  `/readfile {} @{}` or `/readfile @{}/{}`", filename, matching_folders[0].0, matching_folders[0].0, filename));
                                         tx.send(LogEntry::chat_error(msg)).unwrap();
                                     }
                                 }
                             } else if input.starts_with("/list") {
                                 let rest = input.trim_start_matches("/list").trim();
+                                
+                                // Strip quotes if present
+                                let rest = if rest.starts_with('"') && rest.ends_with('"') && rest.len() > 1 {
+                                    &rest[1..rest.len()-1]
+                                } else {
+                                    rest
+                                };
+
+                                let path_buf = PathBuf::from(rest);
+                                if path_buf.is_absolute() {
+                                    let tool = ListDirTool::new();
+                                    tx.send(LogEntry::chat_info(format!("Listing absolute path: {:?}", path_buf))).unwrap();
+                                    match tool.run(&ws, &path_buf).await {
+                                        Ok(files) => {
+                                            let mut out = format!("Files in {:?} ({} found):\n", path_buf, files.len());
+                                            for f in files {
+                                                if let Ok(rel) = f.strip_prefix(&path_buf) {
+                                                    out.push_str(&format!("  - {}\n", rel.to_string_lossy()));
+                                                } else {
+                                                    out.push_str(&format!("  - {}\n", f.to_string_lossy()));
+                                                }
+                                            }
+                                            tx.send(LogEntry::chat_success(out)).unwrap();
+                                        }
+                                        Err(e) => {
+                                            tx.send(LogEntry::chat_error(format!("List error: {}", e))).unwrap();
+                                        }
+                                    }
+                                    return;
+                                }
+
                                 let tag = if rest.starts_with('@') {
                                     Some(rest.trim_start_matches('@').trim())
                                 } else {
@@ -724,6 +968,7 @@ impl eframe::App for SandboxApp {
                                 let mut help_msg = "Available CLI Commands:\n".to_string();
                                 help_msg.push_str("  - `/readfile <file_name>` : Reads file. Warns if it is ambiguous/exists in multiple folders.\n");
                                 help_msg.push_str("  - `/readfile <file_name> @<folder>` : Reads file specifically from the tagged folder.\n");
+                                help_msg.push_str("  - `/readfile @<folder>/<file_name>` : Alternative syntax to read from folder.\n");
                                 help_msg.push_str("  - `/list` : Lists all files across all registered folders.\n");
                                 help_msg.push_str("  - `/list @<folder>` : Lists all files in a specific folder.\n");
                                 help_msg.push_str("  - `/help` : Displays this helper menu.");
