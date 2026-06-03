@@ -1,0 +1,12 @@
+[package]
+name = "my_agent_sdk"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["fs", "rt"] }
+anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"
+
