@@ -1831,6 +1831,7 @@ dependencies = [
  "my_agent_sdk",
  "rfd",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

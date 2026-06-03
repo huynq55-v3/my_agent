@@ -1,0 +1,16 @@
+{
+  "projects": [
+    {
+      "name": "My Awesome Project",
+      "folders": []
+    },
+    {
+      "name": "QuangHuy",
+      "folders": [
+        "/home/huy/Documents/agent_example",
+        "/home/huy/Documents/docs"
+      ]
+    }
+  ],
+  "active_project_index": 1
+}
